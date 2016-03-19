@@ -50,11 +50,11 @@ the handler it spawns a new thread to handle all the network transaction and
 LoRaMac processing.
 '''
 class UpstreamWorkerPool:
-    def __init__(self, loraMac):
-        self.loraMac = loraMac
+    def __init__(self, loraMacProcessor):
+        self.loraMacProcessor = loraMacProcessor
 
     def handleNewConnection(self, conn, addr):
-        worker = PushDataWorker(conn, addr, self.loraMac)
+        worker = PushDataWorker(conn, addr, self.loraMacProcessor)
         logging.info("[Upstream] Connected to %s:%d"%(addr[0],addr[1]))
         worker.start()
 
@@ -62,11 +62,15 @@ class UpstreamWorkerPool:
 This class provides the connection handler to be used by ConnectionAcceptor.
 '''
 class DownstreamWorkerPool:
-    def __init__(self, onGwAvailable, onGwDisconnected):
-        self.onGwAvailable = onGwAvailable
-        self.onGwDisconnected = onGwDisconnected
+    def __init__(self):
+        self.onGwAvailable = None
+        self.onGwDisconnected = None
         self.pullRespThreadPool = {}
         self.gwMacToTempName = {}
+
+    def setGwChangeCallback(self, onGwAvailable, onGwDisconnected):
+        self.onGwAvailable = onGwAvailable
+        self.onGwDisconnected = onGwDisconnected
 
     def makeGwTempName(self, connAddr):
         return "%s:%d"%(connAddr[0],connAddr[1]) # temp name is src_ip:port
@@ -95,7 +99,8 @@ class DownstreamWorkerPool:
     def onGwMacAvailable(self, connAddr, macAddr):
         self.gwMacToTempName[macAddr] = self.makeGwTempName(connAddr)
         # Tell LoRaMac that a new gateway is online
-        self.onGwAvailable(macAddr)
+        if self.onGwAvailable != None:
+            self.onGwAvailable(macAddr)
 
     def onClose(self, macAddr):
         logging.debug("[Downstream] Connection to gateway %s is down"%macAddr)
@@ -106,15 +111,16 @@ class DownstreamWorkerPool:
             del self.gwMacToTempName[macAddr]
 
         # Tell LoRaMac that a gateway is down
-        self.onGwDisconnected(macAddr)
+        if self.onGwDisconnected != None:
+            self.onGwDisconnected(macAddr)
 
 class PushDataWorker(threading.Thread):
-    def __init__(self, conn, addr, loraMac):
+    def __init__(self, conn, addr, loraMacProcessor):
         threading.Thread.__init__(self)
 
         self.conn = conn
         self.addr = addr
-        self.loraMac = loraMac
+        self.loraMacProcessor = loraMacProcessor
         self.macAddr = 0
 
     def parsePushDataMsg(self, data):
@@ -139,32 +145,33 @@ class PushDataWorker(threading.Thread):
             # Retrieve JSON payload
             jsonDict = json.loads(bytes[12:].decode())
 
-            return (token,jsonDict)
+            return (token,jsonDict["rxpk"])
         else:
             logging.warning("[Upstream] Got invalid PUSH_DATA packet")
             return None
 
     def run(self):
         pushAck = bytearray([PROTOCOL_VERSION, 0, 0, PUSH_ACK_ID])
-        try:
-            while True:
-                data = self.conn.recv(512)
-                if len(data) == 0: break # peer has shutdown
-                ret = self.parsePushDataMsg(data)
+        #try:
+        while True:
+            data = self.conn.recv(512)
+            if len(data) == 0: break # peer has shutdown
+            ret = self.parsePushDataMsg(data)
 
-                # If the packet is valid. Send an ACK and then process the data.
-                if ret != None:
-                    (token, jsonDict) = ret
+            # If the packet is valid. Send an ACK and then process the data.
+            if ret != None:
+                (token, rxpkList) = ret
 
-                    # Send ACK
-                    pushAck[1] = token[0]
-                    pushAck[2] = token[1]
-                    self.conn.sendall(pushAck)
+                # Send ACK
+                pushAck[1] = token[0]
+                pushAck[2] = token[1]
+                self.conn.sendall(pushAck)
 
-                    # TODO: process JSON object
-                    print jsonDict
-        except Exception,e:
-            print str(e)
+                # process JSON object
+                for rxpk in rxpkList:
+                    self.loraMacProcessor.processRawRxPayload(self.macAddr, rxpk)
+        #except Exception,e:
+        #   print str(e)
 
         logging.warning("[Upstream] Lost connection to gateway %x"%self.macAddr)
 
@@ -191,7 +198,6 @@ class PullDataWorker(threading.Thread):
             # Process gateway MAC address
             mac_h = struct.unpack("<L", bytes[4:8])[0]
             mac_l = struct.unpack("<L", bytes[8:12])[0]
-            print mac_h, mac_l
             macAddr = (mac_h << 32 | mac_l)
             if self.macAddr == 0:
                 self.macAddr = macAddr
