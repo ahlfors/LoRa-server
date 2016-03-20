@@ -121,7 +121,7 @@ class PushDataWorker(threading.Thread):
         self.conn = conn
         self.addr = addr
         self.loraMacProcessor = loraMacProcessor
-        self.macAddr = 0
+        self.macAddr = None
 
     def parsePushDataMsg(self, data):
         bytes = bytearray(data)
@@ -138,7 +138,9 @@ class PushDataWorker(threading.Thread):
             macAddr = (mac_h << 32 | mac_l)
             # If macAddr does not equal to the macAddr that this thread
             # belongs to, then we have a serious problem..
-            if (self.macAddr != 0 and self.macAddr != macAddr):
+            if (self.macAddr == None):
+                self.macAddr = macAddr
+            elif (self.macAddr != macAddr):
                 logging.warning("[Upstream] Got unexpected MAC address: %x. Expected %x."%(macAddr, self.macAddr))
                 return None
 
@@ -154,6 +156,11 @@ class PushDataWorker(threading.Thread):
         pushAck = bytearray([PROTOCOL_VERSION, 0, 0, PUSH_ACK_ID])
         #try:
         while True:
+            ###
+            # [TODO]: THIS IS VERY WRONG! THIS DOES NOT CHECK FOR PACKET BOUNDARY
+            # Need to re-architect how the received data is interpreted.
+            # Cannot just assume we receive a complete packet everytime!!!
+            ###
             data = self.conn.recv(512)
             if len(data) == 0: break # peer has shutdown
             ret = self.parsePushDataMsg(data)
@@ -184,7 +191,7 @@ class PullDataWorker(threading.Thread):
         self.addr = addr
         self.onGwMacAvailable = onGwMacAvailable
         self.onClose = onClose
-        self.macAddr = 0
+        self.macAddr = None
 
     def parsePullDataMsg(self, data):
         bytes = bytearray(data)
@@ -199,7 +206,7 @@ class PullDataWorker(threading.Thread):
             mac_h = struct.unpack("<L", bytes[4:8])[0]
             mac_l = struct.unpack("<L", bytes[8:12])[0]
             macAddr = (mac_h << 32 | mac_l)
-            if self.macAddr == 0:
+            if self.macAddr == None:
                 self.macAddr = macAddr
                 # Report macAddr avaialble
                 self.onGwMacAvailable(self.addr, self.macAddr)
@@ -218,6 +225,11 @@ class PullDataWorker(threading.Thread):
         pullAck = bytearray([PROTOCOL_VERSION, 0, 0, PULL_ACK_ID])
         try:
             while True:
+                ###
+                # [TODO]: THIS IS VERY WRONG! THIS DOES NOT CHECK FOR PACKET BOUNDARY
+                # Need to re-architect how the received data is interpreted.
+                # Cannot just assume we receive a complete packet everytime!!!
+                ###
                 data = self.conn.recv(128)
                 if len(data) == 0: break # peer has shutdown
 
@@ -256,6 +268,12 @@ class PullRespWorker(threading.Thread):
 
                 logging.info('Sending payload of size %d to GW %x'%(len(payload),macAddr))
 
+                ###
+                # [TODO]: THIS IS VERY WRONG! THIS DOES NOT GUARANTEE PACKET BOUNDARY
+                # Need to re-architect how the data is transmitted.
+                # Need to at least add a length field to the beginning.
+                # But this requires changing the gateway code (change it to actually use TCP)
+                ###
                 self.conn.sendall(payload)
         except Exception,e:
             print str(e)
