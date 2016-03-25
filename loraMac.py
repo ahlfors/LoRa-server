@@ -9,6 +9,7 @@ import json
 from collections import deque
 
 DOWNLINK_QUEUE_MAX_SIZE = 32
+DEVNONCE_HISTORY_LEN = 5
 
 class LoRaMacCrypto:
     CRYPTO_BLOCK_SIZE = 16
@@ -71,8 +72,8 @@ class LoRaMacCrypto:
 class LoRaEndDevice:
     def __init__(self, appEUI, devEUI, appKeyStr):
         '''
-        appEUI: application unique identifier as a 64-bit integer (big endian)
-        devEUI: device unique identifier as a 64-bit integer (big endian)
+        appEUI: application unique identifier as a 64-bit integer
+        devEUI: device unique identifier as a 64-bit integer
         appKeyStr: 16-byte encryption secret key as a byte string
         '''
         ### RF parameters
@@ -95,6 +96,7 @@ class LoRaEndDevice:
         self.nwkSKeyStr = '' # will be set in LoRaMac.handleJoinRequest()
         self.appSKeyStr = '' # will be set in LoRaMac.handleJoinRequest()
         self.joined = False
+        self.devNonceHistory = deque(maxlen=DEVNONCE_HISTORY_LEN)
         self.gateways = set()
         self.dlQueue = deque(maxlen=DOWNLINK_QUEUE_MAX_SIZE)
         self.lock = threading.RLock()
@@ -410,12 +412,15 @@ class LoRaMac:
         return devAddr
 
     def handleJoinRequest(self, dev, devNonce):
-        if False and dev.joined:
-            # [TODO]: check devNonce to prevent replay attacks
-            # if devNonce is different than before, rejoin
-            self.logger.info("Device already joined in network")
+        # check devNonce to prevent replay attacks
+        if (dev.joined and (devNonce in dev.devNonceHistory)):
+            self.logger.info("Replay attack detected. Dropping join request.")
             return
+        dev.devNonceHistory.append(devNonce)
 
+        if dev.devAddr != None:
+            # delete the old mapping
+            del self.addrToDevMap[dev.devAddr]
         devAddr = self.genDevAddr()
         self.addrToDevMap[devAddr] = dev
         dev.devAddr = devAddr
@@ -439,7 +444,6 @@ class LoRaMac:
                                                  bufStr)
         dev.setSessionKeys(nwkSKeyStr, appSKeyStr)
 
-        #import pdb; pdb.set_trace()
         # compose the join-accept message
         mhdr = str(bytearray([(MTYPE_JOIN_ACCEPT << 5) | \
                                MAJOR_VERSION_LORAWAN]))
