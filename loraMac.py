@@ -172,7 +172,7 @@ class LoRaMac:
     DOWNSTREAM_BW500_SPACING_MHZ = 0.6
     DOWNSTREAM_BW500_NUM_CHAN = 8
 
-    def __init__(self, networkID, sendToGatewayFn):
+    def __init__(self, networkID, sendToGatewayFn=None):
         self.networkID = networkID & 0x7F # 7-bit
         self.netID = self.networkID # 24-bit
         self.sendToGateway = sendToGatewayFn
@@ -181,6 +181,9 @@ class LoRaMac:
 
         self.logger = logging.getLogger("LoRaMac")
         self.logger.setLevel(logging.INFO)
+
+    def setGatewaySenderFn(self, fn):
+        self.sendToGateway = fn
 
     def registerEndDevice(self, appEUI, devEUI, appKey):
         '''
@@ -310,7 +313,10 @@ class LoRaMac:
                          "plsize:%d"%(dev.devAddr, gwMacAddr, jsonDict["tmst"],\
                                       jsonDict["freq"], jsonDict["datr"], \
                                       jsonDict["codr"], jsonDict["size"]))
-        self.sendToGateway(gwMacAddr, payloadToGw)
+        if self.sendToGateway != None:
+            self.sendToGateway(gwMacAddr, payloadToGw)
+        else:
+            self.logger.error("No sender function. Please call setGatewaySenderFn().")
 
     def processRawRxPayload(self, gatewayMacAddr, jsonDict):
         '''
@@ -375,7 +381,7 @@ class LoRaMac:
             # | FHDR | FPort | FRMPayload |
             # where FHDR is:
             # | DevAddr | FCtrl | FCnt | Fopts |
-            pass
+            return -1
             #TODO: make sure the network ID in devAddr matches our network ID
         else:
             # Invalid MAC message type. Bail.
@@ -404,7 +410,7 @@ class LoRaMac:
         return devAddr
 
     def handleJoinRequest(self, dev, devNonce):
-        if dev.joined:
+        if False and dev.joined:
             # [TODO]: check devNonce to prevent replay attacks
             # if devNonce is different than before, rejoin
             self.logger.info("Device already joined in network")
