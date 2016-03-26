@@ -14,15 +14,15 @@ TEST_APPLICATION_KEY = [0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
 
 def main():
     # Create the LoRaMac layer processor and the connection manager
-    mac = loraMac.LoRaMac(NETWORK_ID)
+    macSrv = loraMac.LoRaMacServer(NETWORK_ID)
     connMgr = connection.ConnectionManagerUDP(HOST, PORT_UPSTREAM,
                                               PORT_DOWNSTREAM, 
-                                              mac.processRawRxPayload)
-    mac.setGatewaySenderFn(connMgr.sendToGateway)
+                                              macSrv.processRawRxPayload)
+    macSrv.setGatewaySenderFn(connMgr.sendToGateway)
 
     # Manually register a test end device
-    mac.registerEndDevice(TEST_APPLICATION_EUI, TEST_DEVICE_EUI, 
-                          TEST_APPLICATION_KEY)
+    macSrv.registerEndDevice(TEST_APPLICATION_EUI, TEST_DEVICE_EUI, 
+                             TEST_APPLICATION_KEY)
 
     # Main loop. Idle..
     connMgr.startServing()

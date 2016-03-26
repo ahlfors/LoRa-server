@@ -7,6 +7,8 @@ import logging
 import struct
 import json
 from collections import deque
+import math
+import numpy
 
 DOWNLINK_QUEUE_MAX_SIZE = 32
 DEVNONCE_HISTORY_LEN = 5
@@ -16,13 +18,19 @@ class LoRaMacCrypto:
 
     def __init__(self, appKeyStr):
         self.appKeyStr = appKeyStr
-        self.aesWithNwkSKey = None
+        self.nwkSKeyStr = ''
+        self.appSKeyStr = ''
+        self.aesWithNwkSKey = None # Set during a device's join process
         self.aesWithAppSKey = None
 
     def setSessionKeys(self, nwkSKeyStr, appSKeyStr):
-        # TODO: create AES objects that can be reused. But remember to reset
+        # Create AES and CMAC objects that can be reused. But remember to reset
         # them after each encryption operation
-        pass
+        self.aesWithNwkSKey = python_AES.new(nwkSKeyStr, python_AES.MODE_ECB)
+        self.aesWithAppSKey = python_AES.new(appSKeyStr, python_AES.MODE_ECB)
+        #self.cmacWithNwkSKey = python_AES.new(nwkSKeyStr, python_AES.MODE_CMAC)
+        self.nwkSKeyStr = nwkSKeyStr
+        self.appSKeyStr = appSKeyStr
 
     def padToBlockSize(self, byteStr):
         # zero padding
@@ -69,6 +77,72 @@ class LoRaMacCrypto:
         aesWithAppKey = python_AES.new(self.appKeyStr, python_AES.MODE_ECB)
         return aesWithAppKey.encrypt(paddedBuf)
 
+    def computeFrameMic(self, msgStr, updown, devAddr, seqCnt, msgLen):
+        '''
+        msg: | MHDR | FHDR | FPORT | FRMPAYLOAD |
+        updown: 0 for UP_LINK and 1 for DOWN_LINK
+        devAddr (uint32): 4-byte device address
+        seqCnt (uint32): frame count
+        msgLen (uint8): byte count of msg
+
+        LoRaWAN Specification v1.0 Ch4.4
+        '''
+        # no padding is needed for CMAC. No finalizing needed either.
+        byteStr = str(bytearray([0x49, 0, 0, 0, 0, updown,
+                                 devAddr & 0xFF,
+                                 (devAddr >> 8) & 0xFF,
+                                 (devAddr >> 16) & 0xFF,
+                                 (devAddr >> 24) & 0xFF,
+                                 seqCnt & 0xFF,
+                                 (seqCnt >> 8) & 0xFF,
+                                 (seqCnt >> 16) & 0xFF,
+                                 (seqCnt >> 24) & 0xFF,
+                                 0, msgLen])) + msgStr
+        cmacWithNwkSKey = python_AES.new(self.nwkSKeyStr, python_AES.MODE_CMAC)
+        return cmacWithNwkSKey.encrypt(byteStr)[:4]
+
+    def cipherCmdPayload(self, frmPayloadStr, updown, devAddr, seqCnt):
+        return self.cipherPayload(self.aesWithNwkSKey, frmPayloadStr, updown,
+                                  devAddr, seqCnt)
+
+    def cipherDataPayload(self, frmPayloadStr, updown, devAddr, seqCnt):
+        return self.cipherPayload(self.aesWithAppSKey, frmPayloadStr, updown,
+                                  devAddr, seqCnt)
+
+    def cipherPayload(self, aesWithKey, frmPayloadStr, updown, devAddr, seqCnt):
+        '''
+        aesWithKey: a cipher object from CryptoPlus
+        frmPayloadStr: | FRMPayload |
+        updown: 0 for UP_LINK and 1 for DOWN_LINK
+        devAddr (uint32): 4-byte device address
+        seqCnt (uint32): frame count
+
+        LoRaWAN Specification v1.0 Ch4.3.3.1
+        '''
+        paddedPaylod = self.padToBlockSize(frmPayloadStr)
+        k = int(math.ceil(len(frmPayloadStr) / 16.0))
+        A = bytearray([1, 0, 0, 0, 0, updown, devAddr & 0xFF,
+                       (devAddr >> 8) & 0xFF,
+                       (devAddr >> 16) & 0xFF,
+                       (devAddr >> 24) & 0xFF,
+                       seqCnt & 0xFF,
+                       (seqCnt >> 8) & 0xFF,
+                       (seqCnt >> 16) & 0xFF,
+                       (seqCnt >> 24) & 0xFF,
+                       0, 0])
+
+        S = ''
+        aesWithKey.final() # clear the cipher's cache
+        for i in xrange(1, k+1):
+            A[15] = i
+            S += aesWithKey.encrypt(str(A))
+        aesWithKey.final() # clear the cipher's cache
+        
+        dtype = numpy.dtype('<Q8')
+        ciphered = numpy.bitwise_xor(numpy.fromstring(paddedPaylod,dtype=dtype),
+                                   numpy.fromstring(S,dtype=dtype)).tostring()
+        return ciphered[:len(frmPayloadStr)]
+
 class LoRaEndDevice:
     def __init__(self, appEUI, devEUI, appKeyStr):
         '''
@@ -93,26 +167,83 @@ class LoRaEndDevice:
         self.appEUI = appEUI
         self.devEUI = devEUI
         self.appKeyStr = appKeyStr
-        self.nwkSKeyStr = '' # will be set in LoRaMac.handleJoinRequest()
-        self.appSKeyStr = '' # will be set in LoRaMac.handleJoinRequest()
+        self.nwkSKeyStr = '' # will be set in self.onJoin()
+        self.appSKeyStr = '' # will be set in self.onJoin()
         self.joined = False
         self.devNonceHistory = deque(maxlen=DEVNONCE_HISTORY_LEN)
+        self.upSeqCnt_u32 = 0
+        self.downSeqCnt_u32 = 0
         self.gateways = set()
         self.dlQueue = deque(maxlen=DOWNLINK_QUEUE_MAX_SIZE)
         self.lock = threading.RLock()
 
         self.logger = logging.getLogger("Dev(%x)"%devEUI)
+        self.logger.setLevel(logging.INFO)
 
     #def lock(self):
     #    self.lock.acquire()
 
     #def unlock(self):
     #    self.lock.release()
+    
+    def onNewUplinkData(self, fPort, data):
+        self.logger.info("[Uplink Received] fPort:%d data:%s"%(fPort, 
+                                                               str(data)))
 
-    def setSessionKeys(self, nwkSKeyStr, appSKeyStr):
-        self.nwkSKeyStr = nwkSKeyStr
-        self.appSKeyStr = appSKeyStr
-        self.crypto.setSessionKeys(nwkSKeyStr, appSKeyStr)
+    def canJoin(self, devNonce):
+        return devNonce not in self.devNonceHistory
+
+    def onJoin(self, newDevAddr, appNonce, devNonce, netID):
+        # Reset internal variables
+        self.joined = True
+        self.upSeqCnt_u32 = 0
+        self.downSeqCnt_u32 = 0
+        self.devAddr = newDevAddr
+        self.devNonceHistory.append(devNonce)
+
+        # derive the network session key and app session key
+        bufStr = str(bytearray([appNonce & 0xFF,
+                                (appNonce >> 8) & 0xFF,
+                                (appNonce >> 16) & 0xFF,
+                                netID & 0xFF,
+                                (netID >> 8) & 0xFF,
+                                (netID >> 16) & 0xFF,
+                                devNonce & 0xFF,
+                                (devNonce >> 8) & 0xFF,
+                                0,0,0,0,0,0,0]))
+        self.nwkSKeyStr = self.crypto.deriveSessionKey(str(bytearray([0x01])) +\
+                                                       bufStr)
+        self.appSKeyStr = self.crypto.deriveSessionKey(str(bytearray([0x02])) +\
+                                                       bufStr)
+        self.crypto.setSessionKeys(self.nwkSKeyStr, self.appSKeyStr)
+        self.logger.info("NwkSKey: %s"%self.nwkSKeyStr.encode('hex'))
+        self.logger.info("AppSKey: %s"%self.appSKeyStr.encode('hex'))
+
+        # compose the join-accept message
+        mhdr = str(bytearray([(MTYPE_JOIN_ACCEPT << 5) | \
+                               MAJOR_VERSION_LORAWAN]))
+        payload = str(bytearray([ appNonce & 0xFF,
+                                  (appNonce >> 8) & 0xFF,
+                                  (appNonce >> 16) & 0xFF,
+                                  netID & 0xFF,
+                                  (netID >> 8) & 0xFF,
+                                  (netID >> 16) & 0xFF,
+                                  newDevAddr & 0xFF,
+                                  (newDevAddr >> 8) & 0xFF,
+                                  (newDevAddr >> 16) & 0xFF,
+                                  (newDevAddr >> 24) & 0xFF,
+                                  0, # DLSettings
+                                  0, # RxDelay
+                                ]))
+        mic = self.crypto.computeJoinMic(mhdr + payload)
+
+        # encrypt the payload (not including MAC header and MIC)
+        bodyEncrypted = self.crypto.encryptJoinAccept(payload + mic)
+
+        # Queue the downlink. Will be picked up by LoRaMac.doDownlinkToDev()
+        dlMsg = DownlinkMessage(mhdr + bodyEncrypted, JOIN_ACCEPT_WINDOW_1)
+        self.putDownlinkMsg(dlMsg)
+        self.logger.info("Join accept msg downlink queued")
 
     def getRxWindowDelayUsec(self, rxWindow):
         if rxWindow == RX_WINDOW_1:
@@ -151,6 +282,9 @@ RX_WINDOW_2 = 2
 JOIN_ACCEPT_WINDOW_1 = 3
 JOIN_ACCEPT_WINDOW_2 = 4
 
+UP_LINK = 0
+DOWN_LINK = 1
+
 MTYPE_JOIN_REQUEST = 0
 MTYPE_JOIN_ACCEPT = 1
 MTYPE_UNCONFIRMED_DATA_UP = 2
@@ -159,10 +293,15 @@ MTYPE_CONFIRMED_DATA_UP = 4
 MTYPE_CONFIRMED_DATA_DOWN = 5
 MTYPE_RFU = 6
 MTYPE_PROPRIETARY = 7
-
 MAJOR_VERSION_LORAWAN = 0
 
-class LoRaMac:
+FCTRL_FOPTS_LEN_MASK = 0b00001111
+FCTRL_FPENDING_MASK  = 0b00010000
+FCTRL_ACK_MASK       = 0b00100000
+FCTRL_ADRACKREQ_MASK = 0b01000000
+FCTRL_ADR_MASK       = 0b10000000
+
+class LoRaMacServer:
     ### US902-928 Channel Frequencies
     UPSTREAM_BW125_LOWEST_FREQ_MHZ = 902.3
     UPSTREAM_BW125_SPACING_MHZ = 0.2
@@ -181,7 +320,7 @@ class LoRaMac:
         self.euiToDevMap = {}
         self.addrToDevMap = {}
 
-        self.logger = logging.getLogger("LoRaMac")
+        self.logger = logging.getLogger("LoRaMacServer")
         self.logger.setLevel(logging.INFO)
 
     def setGatewaySenderFn(self, fn):
@@ -346,7 +485,7 @@ class LoRaMac:
 
         ### Process the PHY payload, whose structure is:
         ### | MHDR | MACPayload | MIC |
-        mhdrByte = bytearray(phyPayload[0])[0]
+        mhdrByte = ord(phyPayload[0])
         macPayload = phyPayload[1:-4]
         mic = phyPayload[-4:]
         
@@ -355,8 +494,8 @@ class LoRaMac:
 
         if mtype == MTYPE_JOIN_REQUEST:
             appEUI = struct.unpack("<Q", macPayload[0:8])[0] # little endian
-            devEUI = struct.unpack("<Q", macPayload[8:16])[0] # little endian
-            devNonce = struct.unpack("<H",macPayload[16:18])[0] # little endian
+            devEUI = struct.unpack("<Q", macPayload[8:16])[0]
+            devNonce = struct.unpack("<H",macPayload[16:18])[0]
 
             dev = self.getDevFromEUI(appEUI, devEUI)
             if dev == None:
@@ -367,8 +506,8 @@ class LoRaMac:
 
             # Check message integrity (MIC)
             if mic != dev.crypto.computeJoinMic(phyPayload[:-4]):
-                # Bad MIC
-                self.logger.info("Bad packet Message Integrity Code")
+                self.logger.info("Bad packet Message Integrity Code. " \
+                                 "MType: %d"%mtype)
                 return -2
 
             # Handle join request. Should allocate a network address for the
@@ -378,15 +517,86 @@ class LoRaMac:
             with dev.lock:
                 self.handleJoinRequest(dev, devNonce)
 
-        elif mtype == MTYPE_UNCONFIRMED_DATA_UP:
+        elif (mtype == MTYPE_UNCONFIRMED_DATA_UP) or \
+             (mtype == MTYPE_CONFIRMED_DATA_UP):
             # Process the MAC payload, whose structure is:
             # | FHDR | FPort | FRMPayload |
             # where FHDR is:
             # | DevAddr | FCtrl | FCnt | Fopts |
-            return -1
+
+            devAddr = struct.unpack("<L", macPayload[0:4])[0] # little endian
+            if devAddr not in self.addrToDevMap:
+                self.logger.info("Device %x has not joined yet. Dropping " \
+                                 "data frame."%devAddr)
+                return -1
+
+            dev = self.addrToDevMap[devAddr]
+
+            # unpack frame header
+            fCtrl = ord(macPayload[4])
+            fOptsLen = fCtrl & FCTRL_FOPTS_LEN_MASK
+            fPortIdx = 7 + fOptsLen
+            upSeqCnt_u16 = struct.unpack("<H", macPayload[5:7])[0]
+
+            # Correct the 16-bit frame counter for roll-over
+            upSeqCntDiff = (upSeqCnt_u16 - (dev.upSeqCnt_u32 & 0xFFFF))
+            if upSeqCntDiff >= 0:
+                # naively assume there is no roll-ever
+                upSeqCntTemp_u32 = dev.upSeqCnt_u32 + upSeqCntDiff
+            else:
+                # (naively) assume we have ONE 16-bit roll-over.
+                upSeqCntTemp_u32 = dev.upSeqCnt_u32 + 0x10000 + upSeqCntDiff
+
+            # Verify message integrity
+            micCalc = dev.crypto.computeFrameMic(phyPayload[:-4], 
+                                                 UP_LINK,
+                                                 devAddr,
+                                                 upSeqCntTemp_u32,
+                                                 len(phyPayload[:-4]))
+
+            if mic != micCalc:
+                self.logger.info("Bad packet Message Integrity Code. " \
+                                 "MType: %d"%mtype)
+                return -2
+
+            # Handle duplicate packets
+            if (dev.upSeqCnt_u32 == upSeqCntTemp_u32) and \
+               (dev.upSeqCnt_u32 != 0):
+                # TODO: perform ACK to end-device
+                return 0
+            dev.upSeqCnt_u32 = upSeqCntTemp_u32
+
+            if fCtrl & FCTRL_ACK_MASK:
+                # TODO: this is an ACK from the end-device
+                pass
+
+            if fOptsLen > 0:
+                # fOpts contains piggybacked MAC commands (unencrypted)
+                self.processMacCommands(dev, macPayload[7:fPortIdx])
+
+            # "If the frame payload field is not empty, the FPort field must
+            # be present" (LoRaWAN specification v1.0 Ch4.3.2)
+            if fPortIdx < len(macPayload):
+                fPort = ord(macPayload[fPortIdx])
+                frmPayload = macPayload[fPortIdx+1:]
+
+                if fPort == 0:
+                    # frmPayload carries MAC commands, encrypted using the
+                    # network session key
+                    data = dev.crypto.cipherCmdPayload(frmPayload, UP_LINK, 
+                                                       devAddr,
+                                                       dev.upSeqCnt_u32)
+                    self.processMacCommands(dev, data)
+                else:
+                    data = dev.crypto.cipherDataPayload(frmPayload, UP_LINK, 
+                                                        devAddr,
+                                                        dev.upSeqCnt_u32)
+                    dev.onNewUplinkData(fPort, data)
+
             #TODO: make sure the network ID in devAddr matches our network ID
         else:
             # Invalid MAC message type. Bail.
+            self.logger.info("Got invalid MAC message type: %d"%mtype)
             return -1
 
         # Remember that this gateway has access to the device
@@ -395,6 +605,9 @@ class LoRaMac:
         # Signal that we have a downlink opportunity to this device
         self.doDownlinkToDev(dev, eouTimestamp, ulChannel, ulDatarate,
                              ulCodingrate)
+
+    def processMacCommands(self, dev, macCommands):
+        print "Got MAC commands"
 
     def genDevAddr(self):
         ''' 
@@ -413,64 +626,20 @@ class LoRaMac:
 
     def handleJoinRequest(self, dev, devNonce):
         # check devNonce to prevent replay attacks
-        if (dev.joined and (devNonce in dev.devNonceHistory)):
+        if not dev.canJoin(devNonce):
             self.logger.info("Replay attack detected. Dropping join request.")
             return
-        dev.devNonceHistory.append(devNonce)
 
         if dev.devAddr != None:
             # delete the old mapping
             del self.addrToDevMap[dev.devAddr]
-        devAddr = self.genDevAddr()
-        self.addrToDevMap[devAddr] = dev
-        dev.devAddr = devAddr
-        appNonce = random.randint(0, (1<<24)-1)
+        newDevAddr = self.genDevAddr()
+        self.addrToDevMap[newDevAddr] = dev
+        self.logger.info("[handleJoinRequest] Allocated devAddr %x"%newDevAddr)
 
-        self.logger.info("[handleJoinRequest] Allocated devAddr %x"%devAddr)
-
-        # derive the network session key and app session key
-        bufStr = str(bytearray([appNonce & 0xFF,
-                                (appNonce >> 8) & 0xFF,
-                                (appNonce >> 16) & 0xFF,
-                                self.netID & 0xFF,
-                                (self.netID >> 8) & 0xFF,
-                                (self.netID >> 16) & 0xFF,
-                                devNonce & 0xFF,
-                                (devNonce >> 8) & 0xFF,
-                                0,0,0,0,0,0,0]))
-        nwkSKeyStr = dev.crypto.deriveSessionKey(str(bytearray([0x01])) + \
-                                                 bufStr)
-        appSKeyStr = dev.crypto.deriveSessionKey(str(bytearray([0x02])) + \
-                                                 bufStr)
-        dev.setSessionKeys(nwkSKeyStr, appSKeyStr)
-
-        # compose the join-accept message
-        mhdr = str(bytearray([(MTYPE_JOIN_ACCEPT << 5) | \
-                               MAJOR_VERSION_LORAWAN]))
-        payload = str(bytearray([ appNonce & 0xFF,
-                                  (appNonce >> 8) & 0xFF,
-                                  (appNonce >> 16) & 0xFF,
-                                  self.netID & 0xFF,
-                                  (self.netID >> 8) & 0xFF,
-                                  (self.netID >> 16) & 0xFF,
-                                  devAddr & 0xFF,
-                                  (devAddr >> 8) & 0xFF,
-                                  (devAddr >> 16) & 0xFF,
-                                  (devAddr >> 24) & 0xFF,
-                                  0, # DLSettings
-                                  0, # RxDelay
-                                ]))
-        mic = dev.crypto.computeJoinMic(mhdr + payload)
-
-        # encrypt the payload (not including MAC header and MIC)
-        bodyEncrypted = dev.crypto.encryptJoinAccept(payload + mic)
-
-        # Queue the downlink. Will be picked up by doDownlinkToDev()
-        dev.joined = True
-        dlMsg = DownlinkMessage(mhdr + bodyEncrypted, JOIN_ACCEPT_WINDOW_1)
-        dev.putDownlinkMsg(dlMsg)
-
-        self.logger.info("[handleJoinRequest] Join accept msg downlink queued")
+        appNonce = random.randint(0, (1<<24)-1) & 0xFFFFFF
+        # This method will generate and queue the join-accept message
+        dev.onJoin(newDevAddr, appNonce, devNonce, self.netID)
 
 class DownlinkMessage:
     def __init__(self, payloadByteStr, rxWindow):
