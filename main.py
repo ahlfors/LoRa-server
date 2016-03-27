@@ -29,7 +29,9 @@ def main():
     print "Serving on port %d(up) and %d(down)"%(PORT_UPSTREAM, PORT_DOWNSTREAM)
     while True:
         try:
-            time.sleep(1)
+            time.sleep(5)
+            macSrv.scheduleAppDownlink(TEST_APPLICATION_EUI, TEST_DEVICE_EUI,
+                                       45, "Yo I hear you!")
         except KeyboardInterrupt:
             print "Cleaning up......"
             break

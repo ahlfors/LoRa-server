@@ -174,6 +174,8 @@ class LoRaEndDevice:
         self.upSeqCnt_u32 = 0
         self.downSeqCnt_u32 = 0
         self.gateways = set()
+        self.appPendingDownlink = Queue(DOWNLINK_QUEUE_MAX_SIZE)
+        self.macPendingDownlink = Queue(DOWNLINK_QUEUE_MAX_SIZE)
         self.dlQueue = deque(maxlen=DOWNLINK_QUEUE_MAX_SIZE)
         self.lock = threading.RLock()
 
@@ -220,8 +222,8 @@ class LoRaEndDevice:
         self.logger.info("AppSKey: %s"%self.appSKeyStr.encode('hex'))
 
         # compose the join-accept message
-        mhdr = str(bytearray([(MTYPE_JOIN_ACCEPT << 5) | \
-                               MAJOR_VERSION_LORAWAN]))
+        mhdr = str(bytearray([MTYPE_JOIN_ACCEPT_MASK | \
+                              MAJOR_VERSION_LORAWAN]))
         payload = str(bytearray([ appNonce & 0xFF,
                                   (appNonce >> 8) & 0xFF,
                                   (appNonce >> 16) & 0xFF,
@@ -237,7 +239,7 @@ class LoRaEndDevice:
                                 ]))
         mic = self.crypto.computeJoinMic(mhdr + payload)
 
-        # encrypt the payload (not including MAC header and MIC)
+        # encrypt the payload (not including MAC header)
         bodyEncrypted = self.crypto.encryptJoinAccept(payload + mic)
 
         # Queue the downlink. Will be picked up by LoRaMac.doDownlinkToDev()
@@ -285,14 +287,15 @@ JOIN_ACCEPT_WINDOW_2 = 4
 UP_LINK = 0
 DOWN_LINK = 1
 
-MTYPE_JOIN_REQUEST = 0
-MTYPE_JOIN_ACCEPT = 1
-MTYPE_UNCONFIRMED_DATA_UP = 2
-MTYPE_UNCONFIRMED_DATA_DOWN = 3
-MTYPE_CONFIRMED_DATA_UP = 4
-MTYPE_CONFIRMED_DATA_DOWN = 5
-MTYPE_RFU = 6
-MTYPE_PROPRIETARY = 7
+MTYPE_JOIN_REQUEST_MASK          = 0b00000000
+MTYPE_JOIN_ACCEPT_MASK           = 0b00100000
+MTYPE_UNCONFIRMED_DATA_UP_MASK   = 0b01000000
+MTYPE_UNCONFIRMED_DATA_DOWN_MASK = 0b01100000
+MTYPE_CONFIRMED_DATA_UP_MASK     = 0b10000000
+MTYPE_CONFIRMED_DATA_DOWN_MASK   = 0b10100000
+MTYPE_RFU_MASK                   = 0b11000000
+MTYPE_PROPRIETARY_MASK           = 0b11100000
+
 MAJOR_VERSION_LORAWAN = 0
 
 FCTRL_FOPTS_LEN_MASK = 0b00001111
@@ -326,6 +329,16 @@ class LoRaMacServer:
     def setGatewaySenderFn(self, fn):
         self.sendToGateway = fn
 
+    def _EUI_int(self, EUI):
+        if type(EUI) != int:
+            if type(EUI) == list and len(EUI) == 8:
+                return struct.unpack(">Q",bytearray(EUI))[0]
+            else:
+                raise Exception("EUI must be an integer or an int list with " \
+                                "length 8 (big endian).")
+        else:
+            return EUI
+
     def registerEndDevice(self, appEUI, devEUI, appKey):
         '''
         appEUI: application unique identifier. 64-bit integer or an Int list
@@ -335,23 +348,8 @@ class LoRaMacServer:
         appKey: 16-byte encryption secret key as a byte string or an Int list
                 of length 16.
         '''
-        if type(appEUI) != int:
-            if type(appEUI) == list and len(appEUI) == 8:
-                appEUI_int = struct.unpack(">Q",bytearray(appEUI))[0]
-            else:
-                raise Exception("EUI must be an integer or an int list with " \
-                                "length 8 (big endian).")
-        else:
-            appEUI_int = appEUI
-
-        if type(devEUI) != int:
-            if type(devEUI) == list and len(devEUI) == 8:
-                devEUI_int = struct.unpack(">Q",bytearray(devEUI))[0]
-            else:
-                raise Exception("EUI must be an integer or an int list with " \
-                                "length 8 (big endian).")
-        else:
-            devEUI_int = devEUI
+        appEUI_int = self._EUI_int(appEUI)
+        devEUI_int = self._EUI_int(devEUI)
 
         if type(appKey) != str:
             if type(appKey) == list and len(appKey) == 16:
@@ -364,6 +362,85 @@ class LoRaMacServer:
 
         self.euiToDevMap[(appEUI_int, devEUI_int)] = \
                                 LoRaEndDevice(appEUI_int, devEUI_int, appKeyStr)
+
+    def scheduleAppDownlink(self, appEUI, devEUI, appPort, appPayload,
+                            ack=False):
+        appEUI_int = self._EUI_int(appEUI)
+        devEUI_int = self._EUI_int(devEUI)
+
+        dev = self.getDevFromEUI(appEUI_int,devEUI_int)
+        if dev == None or not dev.joined:
+            self.logger.warn("Cannot send frame. Device not registered or not" \
+                             " joined (appEUI %x devEUI %x)"%(appEUI_int,
+                                                              devEUI_int))
+            return -1
+
+        with dev.lock:
+            if dev.appPendingDownlink.full():
+                self.logger.warn("Cannot send frame. Device downlink queue " \
+                                 "full.")
+                return -2
+            dev.appPendingDownlink.put_nowait((appPort, appPayload, ack))
+
+        return 0
+
+    def scheduleMacCmdDownlink(self, dev, macCmdPayload):
+        pass # TODO
+
+    def prepareDownlinkMsg(self, dev):
+        '''
+        Return a DownlinkMessage object
+        '''
+        if len(dev.dlQueue) != 0:
+            return dev.dlQueue.popleft()
+
+        # Retrieve pending app data
+        frmPayload = None
+        if not dev.appPendingDownlink.empty():
+            fPort, frmPayload, appAck = dev.appPendingDownlink.get_nowait()
+            frmPayloadEncrypt = dev.crypto.cipherDataPayload(frmPayload,
+                                                             DOWN_LINK,
+                                                             dev.devAddr,
+                                                             dev.downSeqCnt_u32)
+
+        # Retrieve pending MAC commands
+        fOpts = ''
+        macAck = False
+        if not dev.macPendingDownlink.empty():
+            # if macCmdPayload > 15 bytes and we have no app downlink, use
+            # FPort 0 and pack MAC commands into FRMPayload
+            pass
+            #noOp = False
+
+        if frmPayload == None:
+            # no op
+            return None
+
+        if dev.appPendingDownlink.empty() and dev.macPendingDownlink.empty():
+            fPending = 0
+        else:
+            fPending = FCTRL_FPENDING_MASK
+        
+        if appAck or macAck:
+            ack = FCTRL_ACK_MASK
+            mhdr = chr(MTYPE_CONFIRMED_DATA_DOWN_MASK |
+                       MAJOR_VERSION_LORAWAN)
+        else:
+            ack = 0
+            mhdr = chr(MTYPE_UNCONFIRMED_DATA_DOWN_MASK |
+                       MAJOR_VERSION_LORAWAN)
+
+        # Pack the PHYPayload
+        fCtrl = ack | fPending | (len(fOpts) & 0xF)
+        fhdr = struct.pack("<L", dev.devAddr) + chr(fCtrl) + \
+               struct.pack("<H", dev.downSeqCnt_u32 & 0xFFFF) + fOpts
+        macHdrPayload = mhdr + fhdr + chr(fPort & 0xFF) + frmPayloadEncrypt
+        mic = dev.crypto.computeFrameMic(macHdrPayload, DOWN_LINK, dev.devAddr,
+                                         dev.downSeqCnt_u32, len(macHdrPayload))
+        phyPayload = macHdrPayload + mic
+
+        dev.downSeqCnt_u32 = (dev.downSeqCnt_u32 + 1) & 0xFFFFFFFF
+        return DownlinkMessage(phyPayload, RX_WINDOW_1)
 
     def getDevFromEUI(self, appEUI, devEUI):
         if (appEUI, devEUI) in self.euiToDevMap:
@@ -414,11 +491,11 @@ class LoRaMacServer:
                         ulCodingrate):
         # make the following ops atomic
         with dev.lock:
-            if not dev.hasPendingDownlink():
+            dlMsg = self.prepareDownlinkMsg(dev)
+            if dlMsg == None:
                 # nothing to do
                 self.logger.info("[doDownlinkToDev] No queued downlink")
                 return 0
-            dlMsg = dev.popDownlinkMsg()
 
             ## Find out the time for the RX window
             delayUsec = dev.getRxWindowDelayUsec(dlMsg.rxWindow)
@@ -490,9 +567,9 @@ class LoRaMacServer:
         mic = phyPayload[-4:]
         
         # MHDR: | (7..5) MType | (4..2) RFU | (1..0) Major |
-        mtype = (mhdrByte >> 5) & 0b111
+        mtype = mhdrByte & 0b11100000
 
-        if mtype == MTYPE_JOIN_REQUEST:
+        if mtype == MTYPE_JOIN_REQUEST_MASK:
             appEUI = struct.unpack("<Q", macPayload[0:8])[0] # little endian
             devEUI = struct.unpack("<Q", macPayload[8:16])[0]
             devNonce = struct.unpack("<H",macPayload[16:18])[0]
@@ -517,8 +594,8 @@ class LoRaMacServer:
             with dev.lock:
                 self.handleJoinRequest(dev, devNonce)
 
-        elif (mtype == MTYPE_UNCONFIRMED_DATA_UP) or \
-             (mtype == MTYPE_CONFIRMED_DATA_UP):
+        elif (mtype == MTYPE_UNCONFIRMED_DATA_UP_MASK) or \
+             (mtype == MTYPE_CONFIRMED_DATA_UP_MASK):
             # Process the MAC payload, whose structure is:
             # | FHDR | FPort | FRMPayload |
             # where FHDR is:
@@ -605,6 +682,8 @@ class LoRaMacServer:
         # Signal that we have a downlink opportunity to this device
         self.doDownlinkToDev(dev, eouTimestamp, ulChannel, ulDatarate,
                              ulCodingrate)
+
+        return 0
 
     def processMacCommands(self, dev, macCommands):
         print "Got MAC commands"
